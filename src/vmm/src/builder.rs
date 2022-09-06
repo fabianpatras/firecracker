@@ -16,7 +16,9 @@ use devices::legacy::serial::ReadableFd;
 #[cfg(target_arch = "aarch64")]
 use devices::legacy::RTCDevice;
 use devices::legacy::{EventFdTrigger, SerialDevice, SerialEventsWrapper, SerialWrapper};
-use devices::virtio::{Balloon, Block, MmioTransport, Net, VirtioDevice, Vsock, VsockUnixBackend};
+use devices::virtio::{
+    Balloon, Block, Memory, MmioTransport, Net, VirtioDevice, Vsock, VsockUnixBackend,
+};
 use event_manager::{MutEventSubscriber, SubscriberOps};
 use libc::EFD_NONBLOCK;
 use linux_loader::cmdline::Cmdline as LoaderKernelCmdline;
@@ -50,12 +52,16 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{VmConfigError, VmUpdateConfig};
 use crate::vstate::system::KvmContext;
 use crate::vstate::vcpu::{Vcpu, VcpuConfig};
-use crate::vstate::vm::Vm;
+use crate::vstate::{vm, vm::Vm};
 use crate::{device_manager, mem_size_mib, Error, EventManager, Vmm, VmmEventsObserver};
+
+const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Errors associated with starting the instance.
 #[derive(Debug)]
 pub enum StartMicrovmError {
+    /// Could not register additional guest memory (used by memory device) to VM.
+    AddMemoryDeviceRegion(vm::Error),
     /// Unable to attach block device to Vmm.
     AttachBlockDevice(io::Error),
     /// This error is thrown by the minimal boot loader implementation.
@@ -78,6 +84,8 @@ pub enum StartMicrovmError {
     KernelLoader(linux_loader::loader::Error),
     /// Cannot load command line string.
     LoadCommandline(linux_loader::loader::Error),
+    /// Memory device errors
+    MemoryDevice(devices::virtio::memory::Error),
     /// Cannot start the VM because the kernel was not configured.
     MissingKernelConfig,
     /// Cannot start the VM because the size of the guest memory  was not specified.
@@ -108,9 +116,10 @@ impl Display for StartMicrovmError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         use self::StartMicrovmError::*;
         match self {
-            AttachBlockDevice(err) => {
-                write!(f, "Unable to attach block device to Vmm: {}", err)
+            AddMemoryDeviceRegion(err) => {
+                write!(f, "Could not register additional guest memory: {}", err)
             }
+            AttachBlockDevice(err) => write!(f, "Unable to attach block device to Vmm: {}", err),
             ConfigureSystem(err) => write!(f, "System configuration error: {:?}", err),
             CreateRateLimiter(err) => write!(f, "Cannot create RateLimiter: {}", err),
             CreateNetDevice(err) => {
@@ -147,6 +156,7 @@ impl Display for StartMicrovmError {
                 err_msg = err_msg.replace("\"", "");
                 write!(f, "Cannot load command line string. {}", err_msg)
             }
+            MemoryDevice(err) => write!(f, "Cannot add region for a memory device: {:?}", err),
             MissingKernelConfig => write!(f, "Cannot start microvm without kernel configuration."),
             MissingMemSizeConfig => {
                 write!(f, "Cannot start microvm without guest mem_size config.")
@@ -297,6 +307,7 @@ fn create_vmm_and_vcpus(
         shutdown_exit_code: None,
         vm,
         guest_memory,
+        memory_device_guest_memory: Vec::new(),
         uffd,
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
@@ -377,6 +388,13 @@ pub fn build_microvm_for_boot(
     if let Some(balloon) = vm_resources.balloon.get() {
         attach_balloon_device(&mut vmm, &mut boot_cmdline, balloon, event_manager)?;
     }
+
+    attach_memory_devices(
+        &mut vmm,
+        &mut boot_cmdline,
+        vm_resources.memory.iter(),
+        event_manager,
+    )?;
 
     attach_block_devices(
         &mut vmm,
@@ -1004,6 +1022,51 @@ fn attach_balloon_device(
     let id = String::from(balloon.lock().expect("Poisoned lock").id());
     // The device mutex mustn't be locked here otherwise it will deadlock.
     attach_virtio_device(event_manager, vmm, id, balloon.clone(), cmdline)
+}
+
+fn attach_memory_devices<'a>(
+    vmm: &mut Vmm,
+    cmdline: &mut LoaderKernelCmdline,
+    memory_devices: impl Iterator<Item = &'a Arc<Mutex<Memory>>>,
+    event_manager: &mut EventManager,
+) -> std::result::Result<(), StartMicrovmError> {
+    for (index, memory) in memory_devices.enumerate() {
+        if index > 0 {
+            panic!("too many memory devices. please only use one for now!! Thx >.< !!")
+        }
+
+        let id = String::from(memory.lock().expect("Poisoned lock").id());
+        let size: usize = memory.lock().expect("Poisoned lock").region_size() as usize;
+
+        // The device mutex mustn't be locked here otherwise it will deadlock.
+        attach_virtio_device(event_manager, vmm, id, memory.clone(), cmdline)?;
+
+        // For now, when developing/testing with only one memory device, this hardcoded address
+        // should suffice.
+        let region_start_address = 32 * GIB;
+
+        // Creating the actual memory backend for this memory device.
+        let this_device_memory = vm_memory::create_guest_memory(
+            &[(None, GuestAddress(region_start_address), size)],
+            false,
+        )
+        .map_err(StartMicrovmError::GuestMemoryMmap)?;
+
+        // Adding the memory to the VM.
+        vmm.vm
+            .add_memory(&this_device_memory)
+            .map_err(StartMicrovmError::AddMemoryDeviceRegion)?;
+
+        vmm.memory_device_guest_memory = vec![this_device_memory];
+
+        memory
+            .lock()
+            .expect("Poisoned lock")
+            .set_addr(region_start_address)
+            .map_err(StartMicrovmError::MemoryDevice)?;
+    }
+
+    Ok(())
 }
 
 // Adds `O_NONBLOCK` to the stdout flags.

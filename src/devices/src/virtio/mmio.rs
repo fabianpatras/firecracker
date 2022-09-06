@@ -8,7 +8,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::virtio::device::VirtioDevice;
 use logger::warn;
+
 use utils::byte_order;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
@@ -316,9 +318,10 @@ impl BusDevice for MmioTransport {
             }
             _ => {
                 warn!(
-                    "invalid virtio mmio write: 0x{:x}:0x{:x}",
+                    "invalid virtio mmio write: 0x{:x}:0x{:x} for device type [{}]",
                     offset,
-                    data.len()
+                    data.len(),
+                    self.device().lock().expect("Poisoned Lock!").device_type()
                 );
             }
         }
