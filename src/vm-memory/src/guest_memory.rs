@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use vm_memory_upstream::bitmap::AtomicBitmap;
 use vm_memory_upstream::mmap::{Error as GuestMemoryMmapError, Iter as GuestMemoryIter};
-use vm_memory_upstream::{Address, AddressValue, GuestAddress, GuestMemory, GuestMemoryRegion};
+use vm_memory_upstream::{Address, GuestAddress, GuestMemory, GuestMemoryRegion};
 
 // using this ugly name so we can export `GuestMemoryMmap` internally
 type GuestMemoryMmapUpstream<B> = vm_memory_upstream::GuestMemoryMmap<B>;
