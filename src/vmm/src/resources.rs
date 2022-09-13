@@ -87,7 +87,7 @@ pub struct VmmConfig {
     logger: Option<LoggerConfig>,
     #[serde(rename = "machine-config")]
     machine_config: Option<VmConfig>,
-    #[serde(rename = "memory-devices")]
+    #[serde(rename = "memory-devices", default)]
     memory_devices: Vec<MemoryDeviceConfig>,
     #[serde(rename = "metrics")]
     metrics: Option<MetricsConfig>,
@@ -594,6 +594,7 @@ mod tests {
             balloon: Default::default(),
             net_builder: default_net_builder(),
             mmds: None,
+            memory: Default::default(),
             boot_timer: false,
             mmds_size_limit: HTTP_MAX_PAYLOAD_SIZE,
         }

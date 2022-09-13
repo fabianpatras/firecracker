@@ -1195,6 +1195,7 @@ pub mod tests {
             vcpus_handles: Vec::new(),
             vcpus_exit_evt,
             mmio_device_manager,
+            memory_device_guest_memory: Vec::new(),
             #[cfg(target_arch = "x86_64")]
             pio_device_manager,
         }
