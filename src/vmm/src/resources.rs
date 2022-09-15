@@ -372,7 +372,7 @@ impl VmResources {
 
     /// Sets a memory device to be attached when the VM starts.
     pub fn set_memory_device(&mut self, config: MemoryDeviceConfig) -> Result<MemoryConfigError> {
-        self.memory.set(config)
+        self.memory.insert(config)
     }
 
     /// Set the guest boot source configuration.

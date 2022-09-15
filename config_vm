@@ -30,8 +30,8 @@
 	"memory-devices": [
 		{
 			"id": "memory-dev-1",
-			"region_size": 1024,
-			"block_size": 2
+			"region_size": 1073741824,
+			"block_size": 2097152
 		}
 	],
 	"network-interfaces": [],

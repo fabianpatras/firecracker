@@ -52,7 +52,8 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{VmConfigError, VmUpdateConfig};
 use crate::vstate::system::KvmContext;
 use crate::vstate::vcpu::{Vcpu, VcpuConfig};
-use crate::vstate::{vm, vm::Vm};
+use crate::vstate::vm;
+use crate::vstate::vm::Vm;
 use crate::{device_manager, mem_size_mib, Error, EventManager, Vmm, VmmEventsObserver};
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -1087,10 +1088,11 @@ pub mod tests {
 
     use arch::DeviceType;
     use devices::virtio::vsock::VSOCK_DEV_ID;
-    use devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_VSOCK};
+    use devices::virtio::{TYPE_BALLOON, TYPE_BLOCK, TYPE_MEMORY, TYPE_VSOCK};
     use linux_loader::cmdline::Cmdline;
     use mmds::data_store::{Mmds, MmdsVersion};
     use mmds::ns::MmdsNetworkStack;
+    use utils::get_page_size;
     use utils::tempfile::TempFile;
     use vm_memory::GuestMemory;
 
@@ -1098,6 +1100,7 @@ pub mod tests {
     use crate::vmm_config::balloon::{BalloonBuilder, BalloonDeviceConfig, BALLOON_DEV_ID};
     use crate::vmm_config::boot_source::DEFAULT_KERNEL_CMDLINE;
     use crate::vmm_config::drive::{BlockBuilder, BlockDeviceConfig, CacheType, FileEngineType};
+    use crate::vmm_config::memory::{MemoryBuilder, MemoryDeviceConfig};
     use crate::vmm_config::net::{NetBuilder, NetworkInterfaceConfig};
     use crate::vmm_config::vsock::tests::default_config;
     use crate::vmm_config::vsock::{VsockBuilder, VsockDeviceConfig};
@@ -1300,6 +1303,28 @@ pub mod tests {
         assert!(vmm
             .mmio_device_manager
             .get_device(DeviceType::Virtio(TYPE_BALLOON), BALLOON_DEV_ID)
+            .is_some());
+    }
+
+    fn page_size() -> u64 {
+        get_page_size().unwrap() as u64
+    }
+
+    pub(crate) fn insert_memory_device(
+        vmm: &mut Vmm,
+        cmdline: &mut Cmdline,
+        event_manager: &mut EventManager,
+        memory_config: MemoryDeviceConfig,
+    ) {
+        let id = memory_config.id.clone();
+        let mut builder = MemoryBuilder::new();
+        assert!(builder.insert(memory_config).is_ok());
+
+        assert!(attach_memory_devices(vmm, cmdline, builder.iter(), event_manager).is_ok());
+
+        assert!(vmm
+            .mmio_device_manager
+            .get_device(DeviceType::Virtio(TYPE_MEMORY), id.as_str())
             .is_some());
     }
 
@@ -1636,6 +1661,28 @@ pub mod tests {
         let mut cmdline = default_kernel_cmdline();
         insert_balloon_device(&mut vmm, &mut cmdline, &mut event_manager, balloon_config);
         // Check if the vsock device is described in kernel_cmdline.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        assert!(cmdline
+            .as_str()
+            .contains("virtio_mmio.device=4K@0xd0000000:5"));
+    }
+
+    #[test]
+    fn test_attach_memory_devices() {
+        let mut event_manager = EventManager::new().expect("Unable to create EventManager");
+        let mut vmm = default_vmm();
+
+        let memory_config = MemoryDeviceConfig {
+            block_size: page_size(),
+            id: String::from("mem-dev"),
+            node_id: 0,
+            region_size: 8 * page_size(),
+            requested_size: 0,
+        };
+
+        let mut cmdline = default_kernel_cmdline();
+        insert_memory_device(&mut vmm, &mut cmdline, &mut event_manager, memory_config);
+        // Check if the memory device is described in kernel_cmdline.
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         assert!(cmdline
             .as_str()

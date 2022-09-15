@@ -8,14 +8,14 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use logger::{error, info};
-use utils::{eventfd::EventFd, get_page_size};
+use utils::eventfd::EventFd;
+use utils::get_page_size;
 use virtio_gen::virtio_blk::VIRTIO_F_VERSION_1;
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_MEMORY};
 use super::QUEUE_SIZE;
 use crate::virtio::memory::Error as MemoryError;
-
 use crate::virtio::IrqTrigger;
 
 #[repr(C)]
@@ -63,6 +63,10 @@ impl Memory {
         // memory device is only available for 64 bit platforms
         let page_size: u64 = get_page_size().map_err(MemoryError::PageSize)? as u64;
 
+        if block_size == 0 {
+            return Err(MemoryError::BlockSizeIsZero);
+        }
+
         if block_size % page_size != 0 {
             return Err(MemoryError::BlockSizeNotAllignedToPage);
         }
@@ -77,13 +81,13 @@ impl Memory {
             return Err(MemoryError::SizeNotMultipleOfBlockSize);
         }
 
-        let avail_features = 1u64 << VIRTIO_F_VERSION_1;
-
-        let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(MemoryError::EventFd)?];
-
         if let Some(node_id) = node_id {
             todo!("Node id feature unimplemented [{}]", node_id);
         }
+
+        let avail_features = 1u64 << VIRTIO_F_VERSION_1;
+
+        let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(MemoryError::EventFd)?];
 
         info!(
             "Memory::new({}, {:?}, {}, {})",
@@ -246,4 +250,142 @@ impl VirtioDevice for Memory {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {}
+pub(crate) mod tests {
+    use utils::{byte_order, get_page_size};
+    use virtio_gen::virtio_blk::VIRTIO_F_VERSION_1;
+    use vm_memory::ByteValued;
+
+    use super::super::CONFIG_SPACE_SIZE;
+    use super::{Memory, MemoryError, TYPE_MEMORY};
+    use crate::virtio::memory::device::ConfigSpace;
+    use crate::virtio::{Queue, VirtioDevice};
+
+    impl Memory {
+        pub(crate) fn set_queue(&mut self, idx: usize, q: Queue) {
+            self.queues[idx] = q;
+        }
+    }
+
+    #[test]
+    fn test_new_memory() {
+        let page_size: u64 = get_page_size().unwrap() as u64;
+
+        let block_size_zero = Memory::new(0, None, 0, String::from("memory-dev-1"));
+        match block_size_zero {
+            Err(MemoryError::BlockSizeIsZero) => {}
+            _ => unreachable!(),
+        }
+
+        let block_size_allignment =
+            Memory::new(page_size + 1, None, 0, String::from("memory-dev-2"));
+        match block_size_allignment {
+            Err(MemoryError::BlockSizeNotAllignedToPage) => {}
+            _ => unreachable!(),
+        }
+
+        let block_size_power2 = Memory::new(page_size * 3, None, 0, String::from("memory-dev-3"));
+        match block_size_power2 {
+            Err(MemoryError::BlockSizeNotPowerOf2) => {}
+            _ => unreachable!(),
+        }
+
+        let region_size_multiple =
+            Memory::new(page_size, None, page_size + 1, String::from("memory-dev-4"));
+        match region_size_multiple {
+            Err(MemoryError::SizeNotMultipleOfBlockSize) => {}
+            _ => unreachable!(),
+        }
+
+        let memory_ok =
+            Memory::new(page_size, None, page_size, String::from("memory-dev-5")).unwrap();
+        assert_eq!(memory_ok.device_type(), TYPE_MEMORY);
+        assert_eq!(memory_ok.id(), "memory-dev-5");
+        assert!(!memory_ok.addr_is_set());
+        assert_eq!(memory_ok.acked_features(), 0);
+        assert_eq!(memory_ok.avail_features(), 1u64 << VIRTIO_F_VERSION_1);
+        assert_eq!(memory_ok.block_size(), page_size);
+        assert_eq!(memory_ok.region_size(), page_size);
+    }
+
+    #[test]
+    fn test_read_config() {
+        let page_size: u64 = get_page_size().unwrap() as u64;
+        let memory_device =
+            Memory::new(page_size, None, page_size, String::from("memory-dev")).unwrap();
+
+        // 7 fields of 8 Bytes each
+        let mut actual_config_space = [0u8; CONFIG_SPACE_SIZE];
+
+        memory_device.read_config(0, &mut actual_config_space);
+        // pub block_size: u64,
+        assert_eq!(
+            byte_order::read_le_u64(&actual_config_space[..8]),
+            page_size
+        );
+        // pub node_id: u16,
+        assert_eq!(byte_order::read_le_u16(&actual_config_space[8..10]), 0u16);
+        // _padding: [u8; 6],
+        assert_eq!(&actual_config_space[10..16], [0u8; 6]);
+        // pub addr: u64,
+        assert_eq!(byte_order::read_le_u64(&actual_config_space[16..24]), 0u64);
+        // pub region_size: u64,
+        assert_eq!(
+            byte_order::read_le_u64(&actual_config_space[24..32]),
+            page_size
+        );
+        // pub usable_region_size: u64,
+        assert_eq!(byte_order::read_le_u64(&actual_config_space[32..40]), 0u64);
+        // pub plugged_size: u64,
+        assert_eq!(byte_order::read_le_u64(&actual_config_space[40..41]), 0u64);
+        // pub requested_size: u64,
+        assert_eq!(
+            byte_order::read_le_u64(&actual_config_space[48..CONFIG_SPACE_SIZE]),
+            0u64
+        );
+    }
+
+    #[test]
+    fn test_write_config() {
+        let page_size: u64 = get_page_size().unwrap() as u64;
+        let mut memory_device =
+            Memory::new(page_size, None, page_size, String::from("memory-dev")).unwrap();
+
+        let mut expected_config_space: [u8; CONFIG_SPACE_SIZE] = [0u8; CONFIG_SPACE_SIZE];
+
+        // reading the expected config is assured by `test_read_config()`
+        memory_device.read_config(0, &mut expected_config_space);
+
+        // this write should fail to write
+        let garbage_config_space = [0xffu8; CONFIG_SPACE_SIZE];
+        memory_device.write_config(3, &garbage_config_space);
+
+        // reading again
+        let mut actual_config_space = [0xffu8; CONFIG_SPACE_SIZE];
+        memory_device.read_config(0, &mut actual_config_space);
+
+        // this write should go through setting every bit
+        memory_device.write_config(0, &garbage_config_space);
+
+        memory_device.read_config(0, &mut actual_config_space);
+        assert_eq!(garbage_config_space, actual_config_space);
+
+        // now construction of a valid config space
+        let config_space = ConfigSpace {
+            block_size: page_size * 2,
+            node_id: 0,
+            _padding: [0u8; 6],
+            addr: 0,
+            region_size: page_size * 8,
+            usable_region_size: 0,
+            plugged_size: 0,
+            requested_size: 0,
+        };
+
+        // Writing should go through
+        let new_config_space = config_space.as_slice();
+        memory_device.write_config(0, &new_config_space);
+
+        assert_eq!(memory_device.block_size(), page_size * 2);
+        assert_eq!(memory_device.region_size(), page_size * 8);
+    }
+}

@@ -151,7 +151,8 @@ pub struct Vm {
     #[cfg(target_arch = "aarch64")]
     irqchip_handle: Option<Box<dyn GICDevice>>,
 
-    // the next available slot to be used for adding a user memory region with KVM_SET_USER_MEMORY_REGION
+    // the next available slot to be used for adding a user memory region wit
+    // KVM_SET_USER_MEMORY_REGION
     next_memory_slot: u16,
 }
 
@@ -212,7 +213,8 @@ impl Vm {
         Ok(())
     }
 
-    /// Adds an additional guest_memory to the VM (needed for Virtio Memory Devices) by registering it with KVM.
+    /// Adds an additional guest_memory to the VM (needed for Virtio Memory Devices) by registering
+    /// it with KVM.
     pub fn add_memory(&mut self, guest_mem: &GuestMemoryMmap) -> Result<()> {
         self.set_kvm_memory_regions(guest_mem, false)?;
 
@@ -377,8 +379,9 @@ impl Vm {
                 };
 
                 // This is needed because virtio memory devices introduce a new `GuestMemoryMmap`
-                // for each memory device. And each one of those starts numbering the regions from 0,
-                // but they each must be registered with KVM using unique slot numbers.
+                // for each memory device. And each one of those starts numbering the regions
+                // from 0, but they each must be registered with KVM using unique
+                // slot numbers.
                 self.next_memory_slot += 1;
 
                 // Safe because the fd is a valid KVM file descriptor.

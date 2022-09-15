@@ -8,14 +8,13 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::virtio::device::VirtioDevice;
 use logger::warn;
-
 use utils::byte_order;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 use super::{device_status, *};
 use crate::bus::BusDevice;
+use crate::virtio::device::VirtioDevice;
 
 // TODO crosvm uses 0 here, but IIRC virtio specified some other vendor id that should be used
 const VENDOR_ID: u32 = 0;

@@ -444,7 +444,8 @@ impl MMIODeviceManager {
                     if memory.is_activated() {
                         info!("kick memory device {}.", id);
                         // TODO: This should be memory device trying to process a posssible
-                        // initialization when the `plugged_size` > 0 (See virtio-1.2 Chapter 5.15.5).
+                        // initialization when the `plugged_size` > 0
+                        // (See virtio-1.2 Chapter 5.15.5).
                         memory.process_guest_request_queue();
                     }
                 }
