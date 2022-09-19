@@ -98,6 +98,7 @@ impl MemoryBuilder {
                 None
             },
             cfg.region_size,
+            cfg.requested_size,
             cfg.id,
         )
         .map_err(MemoryConfigError::CreateFailure)?;

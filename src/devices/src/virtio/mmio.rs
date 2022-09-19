@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use logger::warn;
+use logger::{debug, warn};
 use utils::byte_order;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
@@ -310,6 +310,10 @@ impl BusDevice for MmioTransport {
             }
             0x100..=0xfff => {
                 if self.check_device_status(device_status::DRIVER, device_status::FAILED) {
+                    // debug!(
+                    //     "Writing config for device type [{}]",
+                    //     self.locked_device().device_type()
+                    // );
                     self.locked_device().write_config(offset - 0x100, data)
                 } else {
                     warn!("can not write to device config data area before driver is ready");

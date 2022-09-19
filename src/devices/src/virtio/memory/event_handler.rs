@@ -47,6 +47,8 @@ impl MutEventSubscriber for Memory {
         let event_set = event.event_set();
         let supported_events = EventSet::IN;
 
+        debug!("Process!!!!!!!!!");
+
         if !supported_events.contains(event_set) {
             warn!(
                 "Received unknown event: {:?} from source: {:?}",
@@ -61,7 +63,8 @@ impl MutEventSubscriber for Memory {
 
             match source {
                 _ if source == virtq_quest_requests_ev_fd => {
-                    debug!("virtq_quest_requests_ev_fd")
+                    debug!("virtq_quest_requests_ev_fd");
+                    self.process_guest_request_queue().unwrap();
                 }
                 _ if source == activate_fd => {
                     debug!("activate_fd");

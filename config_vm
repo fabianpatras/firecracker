@@ -1,6 +1,6 @@
 {
 	"boot-source": {
-		"kernel_image_path": "hello-vmlinux.bin",
+		"kernel_image_path": "vmlinux",
 		"boot_args": "console=ttyS0 reboot=k panic=1 pci=off",
 		"initrd_path": null
 	},
@@ -22,16 +22,13 @@
 		"smt": false,
 		"track_dirty_pages": false
 	},
-	"balloon": {
-		"amount_mib": 1024,
-		"deflate_on_oom": false,
-		"stats_polling_interval_s": 0
-	},
+	"balloon": null,
 	"memory-devices": [
 		{
 			"id": "memory-dev-1",
 			"region_size": 1073741824,
-			"block_size": 2097152
+			"block_size": 16777216,
+			"requested_size": 268435456
 		}
 	],
 	"network-interfaces": [],

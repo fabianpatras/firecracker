@@ -2,21 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cmp;
+use std::convert::TryInto;
 use std::io::Write;
 use std::result::Result;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use logger::{error, info};
+use logger::{debug, error, info};
 use utils::eventfd::EventFd;
 use utils::get_page_size;
 use virtio_gen::virtio_blk::VIRTIO_F_VERSION_1;
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::{ByteValued, Bytes, GuestMemoryMmap};
 
 use super::super::{ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_MEMORY};
-use super::QUEUE_SIZE;
+use super::{MemoryRequest, MemoryResponse, GUEST_REQUESTS_INDEX, QUEUE_SIZE, VIRTIO_MEM_REQ_PLUG};
 use crate::virtio::memory::Error as MemoryError;
-use crate::virtio::IrqTrigger;
+use crate::virtio::{IrqTrigger, IrqType};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -58,6 +59,7 @@ impl Memory {
         block_size: u64,
         node_id: Option<u16>,
         region_size: u64,
+        requested_size: u64,
         id: String,
     ) -> Result<Memory, MemoryError> {
         // memory device is only available for 64 bit platforms
@@ -80,6 +82,12 @@ impl Memory {
         if region_size % block_size != 0 {
             return Err(MemoryError::SizeNotMultipleOfBlockSize);
         }
+
+        if requested_size % block_size != 0 {
+            return Err(MemoryError::SizeNotMultipleOfBlockSize);
+        }
+
+        let usable_region_size: u64 = std::cmp::min(region_size, 2 * requested_size);
 
         if let Some(node_id) = node_id {
             todo!("Node id feature unimplemented [{}]", node_id);
@@ -104,9 +112,9 @@ impl Memory {
                 _padding: [0u8; 6],
                 addr: 0u64,
                 region_size,
-                usable_region_size: 0u64,
+                usable_region_size,
                 plugged_size: 0u64,
-                requested_size: 0u64,
+                requested_size,
             },
             id,
             irq_trigger: IrqTrigger::new().map_err(MemoryError::EventFd)?,
@@ -118,9 +126,97 @@ impl Memory {
     }
 
     /// Process device virtio queue.
-    pub fn process_guest_request_queue(&mut self) {
-        // TODO
-        info!("Memory.process_guest_requests_queue");
+    pub fn process_guest_requests(&mut self) -> Result<(), MemoryError> {
+        debug!("Memory.process_guest_requests_queue");
+        let device_id = String::from(self.id().clone());
+        // This is safe since we checked in the event handler that the device is activated.
+        let mem = self.device_state.mem().unwrap();
+        let queue = &mut self.queues[GUEST_REQUESTS_INDEX];
+        let mut needs_signal = false;
+
+        while let Some(head) = queue.pop(mem) {
+            if head.is_write_only() {
+                // all requests from the driver should be read only
+                return Err(MemoryError::MalformedDescriptor);
+            }
+
+            let len = head.len as usize;
+            debug!(
+                "Got a descriptor chain with length [{}] and index [{}] has_next [{}]",
+                len,
+                head.index,
+                head.has_next(),
+            );
+
+            if len != std::mem::size_of::<MemoryRequest>() {
+                return Err(MemoryError::MalformedDescriptor);
+            }
+
+            let request = mem
+                .read_obj::<MemoryRequest>(head.addr)
+                .map_err(|_| MemoryError::MalformedDescriptor)?;
+
+            debug!("[Memory] got a request [{:?}]", request);
+
+            match request.req_type {
+                VIRTIO_MEM_REQ_PLUG => {
+                    // do nothing and send ACK back to the queue
+                    debug!(
+                        "[Memory][{}] got a PLUG request .. doing nothing and ACK back ;) .. 
+                          i guess",
+                        device_id
+                    );
+
+                    if let Some(next_descriptor_chain) = head.next_descriptor() {
+                        debug!("this is the descriptor the device has to write into");
+                        debug!(
+                            "this descriptor is write only [{}] has_next [{}]",
+                            next_descriptor_chain.is_write_only(),
+                            next_descriptor_chain.has_next(),
+                        );
+
+                        let resp = MemoryResponse::new().ack();
+
+                        mem.write_obj(resp, next_descriptor_chain.addr)
+                            .map_err(MemoryError::WriteResponse)?;
+
+                        queue
+                            .add_used(
+                                mem,
+                                next_descriptor_chain.index,
+                                std::mem::size_of::<MemoryResponse>().try_into().unwrap(),
+                            )
+                            .map_err(MemoryError::Queue)?;
+                        needs_signal = true;
+                    }
+                }
+                _ => {
+                    unimplemented!("Virtio-mem unimplemented request type")
+                }
+            }
+            // MemTotal:        8155232 kB
+            // MemFree:         8082132 kB
+            // MemAvailable:    7960396 kB
+
+            // ---
+            // MemTotal:        8155232 kB
+            // MemFree:         8085668 kB
+            // MemAvailable:    7963924 kB
+            // panic!("STOP");
+        }
+
+        if needs_signal {
+            self.signal_used_queue()?;
+        }
+
+        Ok(())
+    }
+
+    pub fn process_guest_request_queue(&mut self) -> Result<(), MemoryError> {
+        self.queue_evts[GUEST_REQUESTS_INDEX]
+            .read()
+            .map_err(MemoryError::EventFd)?;
+        self.process_guest_requests()
     }
 
     fn addr_is_set(&self) -> bool {
@@ -152,14 +248,24 @@ impl Memory {
         self.config_space.block_size
     }
 
+    pub(crate) fn signal_used_queue(&self) -> Result<(), MemoryError> {
+        self.irq_trigger
+            .trigger_irq(IrqType::Vring)
+            .map_err(MemoryError::InterruptError)
+    }
+
     /// Handle
     pub fn change_requested_size(&mut self, requested_size: u64) -> Result<(), MemoryError> {
         // TODO
-        info!(
+        debug!(
             "Got a request to change the requested_size of memory device [{}] to [{}] bytes",
             self.id(),
             requested_size
         );
+
+        self.config_space.requested_size = requested_size;
+
+        // self.irq_trigger.trigger_irq()
 
         Ok(())
     }
@@ -220,6 +326,7 @@ impl VirtioDevice for Memory {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
+        debug!("[MEMORY][write_config]");
         let data_len = data.len() as u64;
         let config_space_bytes = self.config_space.as_mut_slice();
         let config_len = config_space_bytes.len() as u64;

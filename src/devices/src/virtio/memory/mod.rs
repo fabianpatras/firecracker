@@ -3,9 +3,13 @@
 
 pub mod device;
 pub mod event_handler;
+pub mod requests;
+
+use vm_memory::GuestMemoryError;
 
 pub use self::device::Memory;
 pub use self::event_handler::*;
+pub use self::requests::*;
 
 pub const QUEUE_SIZE: u16 = 256;
 // the index of guest requests queue from Memory device queues/queues_evts vector.
@@ -22,6 +26,8 @@ pub enum Error {
     Activate(super::ActivateError),
     /// Start address already set
     AddressAlreadySet,
+    ///
+    BadRequest,
     /// Block Size is zero bytes.
     BlockSizeIsZero,
     /// Block Size not alligned to page size.
@@ -34,8 +40,16 @@ pub enum Error {
     DeviceNotFound,
     /// EventFd error.
     EventFd(std::io::Error),
+    /// Received error while sending an interrupt.
+    InterruptError(std::io::Error),
+    /// Guest gave us a malformed descriptor.
+    MalformedDescriptor,
     /// Quereying page size error.
     PageSize(utils::errno::Error),
+    /// Error while processing the virt queues.
+    Queue(super::QueueError),
     /// Size is not a multiple of Block Size.
     SizeNotMultipleOfBlockSize,
+    /// Writing response back to virtuqueu failed.
+    WriteResponse(GuestMemoryError),
 }
