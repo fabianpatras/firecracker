@@ -1,6 +1,6 @@
 {
 	"boot-source": {
-		"kernel_image_path": "hello-vmlinux.bin",
+		"kernel_image_path": "vmlinux",
 		"boot_args": "console=ttyS0 reboot=k panic=1 pci=off",
 		"initrd_path": null
 	},
@@ -26,9 +26,9 @@
 	"memory-devices": [
 		{
 			"id": "memory-dev-1",
-			"region_size_kib": 1048576,
-			"block_size_kib": 512,
-			"requested_size_kib": 1048576
+			"region_size_kib": 8388608,
+			"block_size_kib": 1024,
+			"requested_size_kib": 4194304
 		}
 	],
 	"network-interfaces": [],

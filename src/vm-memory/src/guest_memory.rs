@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::io;
 use std::sync::{Arc, Mutex};
 
-use vm_memory_upstream::bitmap::AtomicBitmap;
+use vm_memory_upstream::bitmap::{AtomicBitmap, Bitmap};
 use vm_memory_upstream::mmap::{Error as GuestMemoryMmapError, Iter as GuestMemoryIter};
 use vm_memory_upstream::{Address, GuestAddress, GuestMemory, GuestMemoryRegion};
 
@@ -45,6 +46,26 @@ pub enum Error {
     TrackerNotFound(String),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum TrackerError {
+    /// Address is not the base address of a block within the region.
+    #[error("Address is not the base address of a block within the region.")]
+    AddressNotBaseOfBlock,
+    /// Provided (absolute) address is outside of memory region.
+    #[error("Provided address is outside of memory region.")]
+    AddressOutsideOfRegion,
+    /// Operation performed on a set of blocks that are not all present inside the
+    /// memory region.
+    #[error("Some blocks are outside of the memory region.")]
+    BlocksOutsideOfRegion,
+    /// Error encountered while trying to change the access rights of the region.
+    #[error("Error while changing protection of region: {0}")]
+    ChangeAccessRights(#[from] io::Error),
+    /// The memory blocks don't all have the same state (plugged/unplugged).
+    #[error("Not all memoyr blocks are (un)plugged.")]
+    InconsistentInternalState,
+}
+
 /// Structure that tracks the validity of memory blocks inside a memory region.
 /// The memory region is a contiguous physical address range inside the
 /// guests' memory so it cannot have holes.
@@ -69,10 +90,33 @@ pub struct MemoryBlockTracker {
     // Should only be modified by the owning memory device.
     bitmap: AtomicBitmap,
 
+    // `bitmap` does not expose `page_size` so we need to keep `block_size` ourselves.
+    block_size: u64,
+
     // Cache for the last valid address. It is always up-to-date. It's easier to update
     // it when hot(un)plugging than to traverse the bitmap.
     // `None` signifies no actual last address -> no memory provided.
     last_addr: Option<GuestAddress>,
+}
+
+fn change_access_rights(
+    region: Arc<GuestRegionMmap>,
+    offset: u64,
+    len: usize,
+    new_prot: i32,
+) -> Result<(), io::Error> {
+    let region_base_ptr = region.as_ptr();
+    let mut addr = unsafe { region_base_ptr.add(offset as usize) } as *mut libc::c_void;
+    // Memory is not backed by a file.
+    let flags = libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS; // | libc::MAP_NORESERVE;
+
+    addr = unsafe { libc::mmap(addr, len, new_prot, flags, -1, 0) };
+
+    if addr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 impl MemoryBlockTracker {
@@ -82,15 +126,96 @@ impl MemoryBlockTracker {
         MemoryBlockTracker {
             memory_region,
             bitmap,
+            block_size: block_size as u64,
             last_addr: None,
         }
     }
-}
 
-impl MemoryBlockTracker {
+    /// Hotplugs memory blocks starting with (absolute) address provided.
+    ///
+    /// Only performs the action if all the blocks correspond to this memory region and none
+    /// of them are already plugged.
+    pub fn plug_blocks(
+        &mut self,
+        block_start_addr: u64,
+        nr_blocks: u64,
+    ) -> Result<(), TrackerError> {
+        let start_block_index;
+        let block_offset_addr;
+
+        match self
+            .memory_region
+            .to_region_addr(GuestAddress::new(block_start_addr))
+        {
+            Some(offset) => {
+                // Provided address does not correspond to the start of a block inside
+                // this region. Returning error so that caller can report furter.
+                if offset.raw_value() % self.block_size != 0 {
+                    return Err(TrackerError::AddressNotBaseOfBlock);
+                }
+
+                start_block_index = offset.raw_value() / self.block_size;
+                let last_block_index = start_block_index + nr_blocks;
+
+                // Is the index of the last block we want to operate on is bigger than
+                // the total number of blocks this regions has?
+
+                // Example
+                // region:          [0, 1, 2, 3, 4, 5, 6, 7] -> 8 blocks
+                // start_block_index = 3 -----^           ^
+                // nr_blocks = 5              |           |
+                // blocks covered:            |-----------|   (3, 4, 5, 6, 7)
+                // This is valid, but with `nr_blocks` = 6 it would overflow.
+                if last_block_index > (self.bitmap.len() as u64) {
+                    return Err(TrackerError::BlocksOutsideOfRegion);
+                }
+
+                block_offset_addr = offset;
+
+                if (start_block_index..=last_block_index)
+                    .into_iter()
+                    .map(|index| self.bitmap.is_bit_set(index as usize))
+                    .any(|res| res)
+                {
+                    return Err(TrackerError::InconsistentInternalState);
+                }
+            }
+            None => {
+                return Err(TrackerError::AddressOutsideOfRegion);
+            }
+        }
+
+        // Checks performed so now we know that the block start address is a valid and
+        // all of them are unplugged.
+
+        let len = (nr_blocks * self.block_size) as usize;
+
+        change_access_rights(
+            self.memory_region.clone(),
+            block_offset_addr.raw_value(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+        )?;
+
+        self.bitmap
+            .mark_dirty(block_offset_addr.raw_value() as usize, len);
+
+        // TODO: update last address;
+
+        Ok(())
+    }
+
     /// Retrieves the last (inclusive) valid address tracked.
     fn last_addr(&self) -> Option<GuestAddress> {
         self.last_addr
+    }
+
+    /// Checks whether an addres is valid inside the tracked region.
+    fn addr_is_valid(&self, addr: GuestAddress) -> bool {
+        match self.memory_region.to_region_addr(addr) {
+            Some(offset) => self.bitmap.is_addr_set(offset.raw_value() as usize),
+            None => false,
+        }
     }
 }
 
@@ -155,9 +280,26 @@ impl GuestMemory for GuestMemoryMmap {
             return false;
         }
 
-        // TODO: Here comes the logic for when the address is inside the memory regions,
-        // but we still need to check if the address is valid based on who provides that region.
-        true
+        // Previous check made sure the address belongs to a region.
+        let region = self
+            .mmap
+            .find_region(addr)
+            .expect("Memory broken internal state.");
+
+        let base_addr = region.start_addr().raw_value();
+        let locked_state = self.state.lock().expect("Poisoned lock");
+
+        // Base address was retrieved from a valid region.
+        let region_state = locked_state
+            .get(&base_addr)
+            .expect("Memory broken internal state.");
+
+        match region_state {
+            RegionState::Fixed => true,
+            RegionState::Volatile(tracker) => {
+                tracker.lock().expect("Poisoned lock").addr_is_valid(addr)
+            }
+        }
     }
 
     /// Return the last (inclusive) address.
@@ -231,8 +373,8 @@ impl GuestMemoryMmap {
         let mut mmap_regions = Vec::with_capacity(regions.len());
 
         for region in regions {
-            let (region, device_info) = (region.0, region.1);
-            let base_addr = region.start_addr().raw_value();
+            let (region_mmap, device_info) = (region.0, region.1);
+            let base_addr = region_mmap.start_addr().raw_value();
             let region_state;
 
             if let Some(block_size) = device_info {
@@ -240,7 +382,7 @@ impl GuestMemoryMmap {
                 device_present = true;
 
                 let block_tracker = Arc::new(Mutex::new(MemoryBlockTracker::new(
-                    region.clone(),
+                    region_mmap.clone(),
                     block_size,
                 )));
 
@@ -256,7 +398,7 @@ impl GuestMemoryMmap {
             if state.insert(base_addr, region_state).is_some() {
                 return Err(Error::DuplicateBaseAddress(base_addr));
             };
-            mmap_regions.push(region);
+            mmap_regions.push(region_mmap);
         }
 
         Ok(Self {

@@ -5,9 +5,13 @@ use std::fmt;
 
 pub mod device;
 pub mod event_handler;
+pub mod requests;
+
+use vm_memory::GuestMemoryError;
 
 pub use self::device::Memory;
 pub use self::event_handler::*;
+pub use self::requests::*;
 
 pub const QUEUE_SIZE: u16 = 256;
 // the index of guest requests queue from Memory device queues/queues_evts vector.
@@ -34,16 +38,24 @@ pub enum Error {
     DeviceNotFound,
     /// EventFd error.
     EventFd(std::io::Error),
+    /// Received error while sending an interrupt.
+    InterruptError(std::io::Error),
+    /// Guest gave us a malformed descriptor.
+    MalformedDescriptor,
     /// Quereying page size error.
     PageSize(utils::errno::Error),
+    /// Error while processing the virt queues.
+    Queue(super::QueueError),
     /// Size is not a multiple of Block Size.
     SizeNotMultipleOfBlockSize,
+    /// Writing response back to virtuqueu failed.
+    WriteResponse(GuestMemoryError),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use self::Error::*;
-        match &self {
+        match self {
             AddressAlreadySet => write!(f, "Memory region start address is already set"),
             BlockSizeIsZero => write!(f, "Block size cannot be 0"),
             BlockSizeNotMultipleOfPageSize(size) => write!(
@@ -60,8 +72,10 @@ impl fmt::Display for Error {
                 f,
                 "Device memory region size is not a multiple of block size"
             ),
+            InterruptError(_) => todo!(),
+            MalformedDescriptor => todo!(),
+            Queue(_) => todo!(),
+            WriteResponse(_) => todo!(),
         }
     }
 }
-
-pub type MemoryResult<T> = std::result::Result<T, Error>;

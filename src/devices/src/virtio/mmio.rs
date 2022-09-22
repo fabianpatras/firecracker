@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use logger::warn;
+use logger::{debug, warn};
 use utils::byte_order;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
@@ -297,8 +297,14 @@ impl BusDevice for MmioTransport {
                         }
                     }
                     0x70 => self.set_device_status(v),
-                    0x80 => self.update_queue_field(|q| lo(&mut q.desc_table, v)),
-                    0x84 => self.update_queue_field(|q| hi(&mut q.desc_table, v)),
+                    0x80 => self.update_queue_field(|q| {
+                        debug!("lo[{:#x}]", v);
+                        lo(&mut q.desc_table, v);
+                    }),
+                    0x84 => self.update_queue_field(|q| {
+                        debug!("hi[{:#x}]", v);
+                        hi(&mut q.desc_table, v)
+                    }),
                     0x90 => self.update_queue_field(|q| lo(&mut q.avail_ring, v)),
                     0x94 => self.update_queue_field(|q| hi(&mut q.avail_ring, v)),
                     0xa0 => self.update_queue_field(|q| lo(&mut q.used_ring, v)),
@@ -310,6 +316,10 @@ impl BusDevice for MmioTransport {
             }
             0x100..=0xfff => {
                 if self.check_device_status(device_status::DRIVER, device_status::FAILED) {
+                    // debug!(
+                    //     "Writing config for device type [{}]",
+                    //     self.locked_device().device_type()
+                    // );
                     self.locked_device().write_config(offset - 0x100, data)
                 } else {
                     warn!("can not write to device config data area before driver is ready");

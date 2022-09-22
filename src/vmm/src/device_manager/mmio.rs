@@ -446,7 +446,7 @@ impl MMIODeviceManager {
                         // TODO: This should be memory device trying to process a posssible
                         // initialization when the `plugged_size` > 0
                         // (See virtio-1.2 Chapter 5.15.5).
-                        memory.process_guest_request_queue();
+                        memory.process_guest_request_queue().unwrap();
                     }
                 }
                 _ => (),

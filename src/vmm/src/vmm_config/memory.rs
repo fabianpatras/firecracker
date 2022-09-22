@@ -95,6 +95,7 @@ impl MemoryBuilder {
             cfg.block_size_kib * KIB,
             cfg.node_id,
             cfg.region_size_kib * KIB,
+            cfg.requested_size_kib * KIB,
             cfg.id,
         )
         .map_err(MemoryConfigError::CreateFailure)?;
