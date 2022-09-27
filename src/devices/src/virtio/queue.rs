@@ -15,6 +15,8 @@ use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
 };
 
+use super::device::MyBitmap;
+
 pub(super) const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 pub(super) const VIRTQ_DESC_F_WRITE: u16 = 0x2;
 
@@ -222,7 +224,7 @@ impl Queue {
         min(self.size, self.max_size)
     }
 
-    pub fn is_valid(&self, mem: &GuestMemoryMmap) -> bool {
+    pub fn is_valid(&self, mem: &GuestMemoryMmap, bitmap: &MyBitmap) -> bool {
         let queue_size = u64::from(self.actual_size());
         let desc_table = self.desc_table;
         let desc_table_size = 16 * queue_size;

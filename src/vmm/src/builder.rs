@@ -3,7 +3,7 @@
 
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::fmt::{Display, Formatter};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -34,7 +34,7 @@ use userfaultfd::Uffd;
 use utils::eventfd::EventFd;
 use utils::terminal::Terminal;
 use utils::time::TimestampUs;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemoryMmap};
 #[cfg(target_arch = "aarch64")]
 use vm_superio::Rtc;
 use vm_superio::Serial;
@@ -308,7 +308,6 @@ fn create_vmm_and_vcpus(
         shutdown_exit_code: None,
         vm,
         guest_memory,
-        memory_device_guest_memory: Vec::new(),
         uffd,
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
@@ -341,8 +340,11 @@ pub fn build_microvm_for_boot(
     let boot_config = vm_resources.boot_source().ok_or(MissingKernelConfig)?;
 
     let track_dirty_pages = vm_resources.track_dirty_pages();
-    let guest_memory =
-        create_guest_memory(vm_resources.vm_config().mem_size_mib, track_dirty_pages)?;
+    let guest_memory = create_guest_memory(
+        vm_resources.vm_config().mem_size_mib,
+        vm_resources.memory.iter(),
+        track_dirty_pages,
+    )?;
     let vcpu_config = vm_resources.vcpu_config();
     let entry_addr = load_kernel(boot_config, &guest_memory)?;
     let initrd = load_initrd_from_config(boot_config, &guest_memory)?;
@@ -630,21 +632,57 @@ pub fn build_microvm_from_snapshot(
 }
 
 /// Creates GuestMemory of `mem_size_mib` MiB in size.
-pub fn create_guest_memory(
+pub fn create_guest_memory<'a>(
     mem_size_mib: usize,
+    memory_devices: impl Iterator<Item = &'a Arc<Mutex<Memory>>>,
     track_dirty_pages: bool,
 ) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
     let mem_size = mem_size_mib << 20;
+
+    // this line creates 1 (potentially 2) pairs (start_address, size) depending on the arch
     let arch_mem_regions = arch::arch_memory_regions(mem_size);
 
+    // adding a new member to the tuple saying it is not a memory device
+    let mut mem_regions = arch_mem_regions
+        .iter()
+        .map(|(addr, size)| (*addr, *size, false))
+        .collect::<Vec<_>>();
+
+    let arbitrary_address = GuestAddress::new(32 * GIB);
+
+    let mut last_address: GuestAddress;
+    {
+        let temp_guest_address = match mem_regions.last() {
+            Some((guest_address, _, _)) => std::cmp::max(guest_address, &arbitrary_address),
+            _ => unreachable!(),
+        };
+
+        last_address = temp_guest_address.clone();
+    }
+
+    // here ne need to do some magic so that for each memory device
+    for memory_device in memory_devices {
+        let mut locked_memory_device = memory_device.lock().expect("Poisoned lock");
+
+        let size = locked_memory_device.region_size();
+
+        mem_regions.push((last_address.clone(), size.try_into().unwrap(), true));
+        locked_memory_device.set_addr(last_address.0).unwrap();
+
+        // pushing back the last_address
+        last_address = last_address.checked_add(size).unwrap();
+    }
+
     vm_memory::create_guest_memory(
-        &arch_mem_regions
+        &mem_regions
             .iter()
-            .map(|(addr, size)| (None, *addr, *size))
+            .map(|(addr, size, memory_device)| (None, *addr, *size, *memory_device))
             .collect::<Vec<_>>()[..],
         track_dirty_pages,
     )
     .map_err(StartMicrovmError::GuestMemoryMmap)
+
+    // in pucutul asta avem vectorul de arcuri de regiuni
 }
 
 fn load_kernel(
@@ -1037,28 +1075,30 @@ fn attach_memory_devices<'a>(
         }
 
         let id = String::from(memory.lock().expect("Poisoned lock").id());
-        let size: usize = memory.lock().expect("Poisoned lock").region_size() as usize;
+        let _size: usize = memory.lock().expect("Poisoned lock").region_size() as usize;
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
         attach_virtio_device(event_manager, vmm, id, memory.clone(), cmdline)?;
+
+        // aici ar trebui memory dev sa primeasca regiunea
 
         // For now, when developing/testing with only one memory device, this hardcoded address
         // should suffice.
         let region_start_address = 32 * GIB;
 
         // Creating the actual memory backend for this memory device.
-        let this_device_memory = vm_memory::create_guest_memory(
-            &[(None, GuestAddress(region_start_address), size)],
-            false,
-        )
-        .map_err(StartMicrovmError::GuestMemoryMmap)?;
+        // let _this_device_memory = vm_memory::create_guest_memory(
+        //     &[(None, GuestAddress(region_start_address), size)],
+        //     false,
+        // )
+        // .map_err(StartMicrovmError::GuestMemoryMmap)?;
 
         // Adding the memory to the VM.
-        vmm.vm
-            .add_memory(&this_device_memory)
-            .map_err(StartMicrovmError::AddMemoryDeviceRegion)?;
+        // vmm.vm
+        //     .add_memory(&this_device_memory)
+        //     .map_err(StartMicrovmError::AddMemoryDeviceRegion)?;
 
-        vmm.memory_device_guest_memory = vec![this_device_memory];
+        // vmm.memory_device_guest_memory = vec![this_device_memory];
 
         memory
             .lock()

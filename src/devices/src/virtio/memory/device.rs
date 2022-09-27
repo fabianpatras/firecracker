@@ -10,7 +10,7 @@ use logger::{error, info};
 use utils::eventfd::EventFd;
 use utils::get_page_size;
 use virtio_gen::virtio_blk::VIRTIO_F_VERSION_1;
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::{ByteValued, GuestMemoryMmap, GuestRegionMmap};
 
 use super::super::{ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_MEMORY};
 use super::{MemoryResult, QUEUE_SIZE};
@@ -50,9 +50,12 @@ pub struct Memory {
     // Implementation specific fields.
     pub(crate) id: String,
     addr_is_set: bool,
+    _memory_region: Option<Arc<GuestRegionMmap>>,
 }
 
 impl Memory {
+    /// Creates the memory device's inner structstures,
+    /// but it does not yet have a reference to a Memory Region
     pub fn new(
         block_size: u64,
         node_id: Option<u16>,
@@ -116,6 +119,7 @@ impl Memory {
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(MemoryError::EventFd)?,
             queues: [Queue::new(QUEUE_SIZE)],
             queue_evts,
+            _memory_region: None,
         })
     }
 
@@ -138,6 +142,11 @@ impl Memory {
         self.config_space.addr = addr;
 
         Ok(())
+    }
+
+    pub fn set_region(&mut self, region: Arc<GuestRegionMmap>) {
+        // this is already cloned
+        self._memory_region = Some(region);
     }
 
     /// Resturns the identifier of the device.

@@ -108,10 +108,10 @@ fn build_guarded_region(
 
 /// Helper for creating the guest memory.
 pub fn create_guest_memory(
-    regions: &[(Option<FileOffset>, GuestAddress, usize)],
+    regions: &[(Option<FileOffset>, GuestAddress, usize, bool)],
     track_dirty_pages: bool,
 ) -> std::result::Result<GuestMemoryMmap, Error> {
-    let prot = libc::PROT_READ | libc::PROT_WRITE;
+    let mut prot = libc::PROT_READ | libc::PROT_WRITE;
     let mut mmap_regions = Vec::with_capacity(regions.len());
 
     for region in regions {
@@ -119,6 +119,11 @@ pub fn create_guest_memory(
             None => libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             Some(_) => libc::MAP_NORESERVE | libc::MAP_PRIVATE,
         };
+
+        // Memory devices start with `PROT_NONE`. Plugging memory gives them permissions.
+        if region.3 {
+            prot = libc::PROT_NONE;
+        }
 
         let mmap_region =
             build_guarded_region(region.0.clone(), region.2, prot, flags, track_dirty_pages)
@@ -181,7 +186,10 @@ pub mod test_utils {
         track_dirty_pages: bool,
     ) -> std::result::Result<GuestMemoryMmap, Error> {
         create_guest_memory(
-            &regions.iter().map(|r| (None, r.0, r.1)).collect::<Vec<_>>(),
+            &regions
+                .iter()
+                .map(|r| (None, r.0, r.1, false))
+                .collect::<Vec<_>>(),
             track_dirty_pages,
         )
     }

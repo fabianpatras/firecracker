@@ -89,10 +89,12 @@ impl MmioTransport {
     }
 
     fn are_queues_valid(&self) -> bool {
+        let dummy_bitmap: MyBitmap = Default::default();
+
         self.locked_device()
             .queues()
             .iter()
-            .all(|q| q.is_valid(&self.mem))
+            .all(|q| q.is_valid(&self.mem, &dummy_bitmap))
     }
 
     fn with_queue<U, F>(&self, d: U, f: F) -> U

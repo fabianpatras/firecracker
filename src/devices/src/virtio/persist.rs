@@ -123,6 +123,7 @@ impl VirtioDeviceState {
         expected_num_queues: usize,
         expected_queue_max_size: u16,
     ) -> std::result::Result<Vec<Queue>, Error> {
+        let dummy_bitmap: MyBitmap = Default::default();
         // Sanity check:
         // - right device type,
         // - acked features is a subset of available ones,
@@ -157,7 +158,7 @@ impl VirtioDeviceState {
             // when fields are only partially configured.
             //
             // Only if the device was activated, check `q.is_valid()`.
-            if self.activated && !q.is_valid(mem) {
+            if self.activated && !q.is_valid(mem, &dummy_bitmap) {
                 return Err(Error::InvalidInput);
             }
         }

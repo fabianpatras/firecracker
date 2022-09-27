@@ -45,6 +45,11 @@ pub enum IrqType {
     Vring,
 }
 
+#[derive(Default)]
+pub struct MyBitmap {
+    bitmap: Vec<bool>,
+}
+
 /// Helper struct that is responsible for triggering guest IRQs
 pub struct IrqTrigger {
     pub(crate) irq_status: Arc<AtomicUsize>,
