@@ -11,7 +11,7 @@ use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
 use vm_memory::{
     Bitmap, Bytes, FileOffset, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
-    GuestMemoryRegion, MemoryRegionAddress,
+    GuestMemoryRegion, MemoryRegionAddress, RegionInfo,
 };
 
 use crate::DirtyBitmap;
@@ -183,10 +183,16 @@ impl SnapshotMemory for GuestMemoryMmap {
                 None => None,
             };
 
-            regions.push((f, GuestAddress(region.base_address), region.size));
+            // `None` comes from the fact this region is not backed by a memory device
+            regions.push(RegionInfo::new(
+                f,
+                GuestAddress(region.base_address),
+                region.size,
+                None,
+            ));
         }
 
-        vm_memory::create_guest_memory(&regions, track_dirty_pages).map_err(Error::CreateMemory)
+        vm_memory::create_guest_memory(regions, track_dirty_pages).map_err(Error::CreateMemory)
     }
 }
 

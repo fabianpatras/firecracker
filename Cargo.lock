@@ -1242,6 +1242,7 @@ name = "vm-memory"
 version = "0.3.0"
 dependencies = [
  "libc",
+ "thiserror",
  "utils",
  "vm-memory 0.8.0",
 ]

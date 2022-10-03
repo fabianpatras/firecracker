@@ -7,21 +7,53 @@
 
 use std::io::Error as IoError;
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 
 pub mod guest_memory;
 
-pub use guest_memory::{GuestMemoryMmap, GuestMmapRegion, GuestRegionMmap};
+use guest_memory::Region;
+pub use guest_memory::{
+    Error, GuestMemoryMmap, GuestMmapRegion, GuestRegionMmap, MemoryBlockTracker,
+};
 use vm_memory_upstream::bitmap::AtomicBitmap;
 pub use vm_memory_upstream::bitmap::Bitmap;
 use vm_memory_upstream::mmap::{check_file_offset, NewBitmap};
 pub use vm_memory_upstream::mmap::{MmapRegionBuilder, MmapRegionError};
 pub use vm_memory_upstream::{
-    address, Address, ByteValued, Bytes, Error, FileOffset, GuestAddress, GuestMemory,
-    GuestMemoryError, GuestMemoryRegion, GuestUsize, MemoryRegionAddress, MmapRegion,
+    address, Address, ByteValued, Bytes, Error as GuestMemoryMmapError, FileOffset, GuestAddress,
+    GuestMemory, GuestMemoryError, GuestMemoryRegion, GuestUsize, MemoryRegionAddress, MmapRegion,
     VolatileMemory, VolatileMemoryError,
 };
 
+// 32 GiB; Memory devices will get inserted starting with `min(32 GiB, last_existing_address)`.
+pub const VIRTO_MEM_LOWER_ADDRESS_BOUND: u64 = 32 << 30;
+
 const GUARD_PAGE_COUNT: usize = 1;
+
+pub struct RegionInfo {
+    file_offset: Option<FileOffset>,
+    start_address: GuestAddress,
+    size: usize,
+    // information about memory device if any: (block_size)
+    device_block_size: Option<usize>,
+}
+
+impl RegionInfo {
+    pub fn new(
+        file_offset: Option<FileOffset>,
+        start_address: GuestAddress,
+        size: usize,
+        // information about memory device if any: (id, block_size)
+        device_block_size: Option<usize>,
+    ) -> Self {
+        Self {
+            file_offset,
+            start_address,
+            size,
+            device_block_size,
+        }
+    }
+}
 
 /// Build a `MmapRegion` surrounded by guard pages.
 ///
@@ -107,26 +139,45 @@ fn build_guarded_region(
 
 /// Helper for creating the guest memory.
 pub fn create_guest_memory(
-    regions: &[(Option<FileOffset>, GuestAddress, usize)],
+    //     (
+    //     Option<FileOffset>,
+    //     GuestAddress,
+    //     usize,
+    //     // information about memory device if any: (block_size)
+    //     Option<usize>,
+    // )
+    regions: Vec<RegionInfo>,
     track_dirty_pages: bool,
 ) -> std::result::Result<GuestMemoryMmap, Error> {
-    let prot = libc::PROT_READ | libc::PROT_WRITE;
     let mut mmap_regions = Vec::with_capacity(regions.len());
 
     for region in regions {
-        let flags = match region.0 {
+        let flags = match region.file_offset {
             None => libc::MAP_NORESERVE | libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
             Some(_) => libc::MAP_NORESERVE | libc::MAP_PRIVATE,
         };
+        let mut prot = libc::PROT_READ | libc::PROT_WRITE;
+        let device_info = &region.device_block_size;
 
-        let mmap_region =
-            build_guarded_region(region.0.clone(), region.2, prot, flags, track_dirty_pages)
-                .map_err(Error::MmapRegion)?;
+        if let Some(_) = device_info {
+            prot = libc::PROT_NONE;
+        }
 
-        mmap_regions.push(GuestRegionMmap::new(mmap_region, region.1)?);
+        let mmap_region = build_guarded_region(
+            region.file_offset,
+            region.size,
+            prot,
+            flags,
+            track_dirty_pages,
+        )
+        .map_err(GuestMemoryMmapError::MmapRegion)?;
+
+        let mmap_region = GuestRegionMmap::new(mmap_region, region.start_address)?;
+
+        mmap_regions.push(Region::new(Arc::new(mmap_region), device_info.clone()));
     }
 
-    GuestMemoryMmap::from_regions(mmap_regions)
+    GuestMemoryMmap::new(mmap_regions)
 }
 
 pub fn mark_dirty_mem(mem: &GuestMemoryMmap, addr: GuestAddress, len: usize) {
@@ -166,7 +217,7 @@ pub mod test_utils {
                 .with_mmap_prot(prot)
                 .with_mmap_flags(flags)
                 .build()
-                .map_err(Error::MmapRegion)?,
+                .map_err(GuestMemoryMmapError::MmapRegion)?,
                 region.0,
             )?);
         }
@@ -180,7 +231,10 @@ pub mod test_utils {
         track_dirty_pages: bool,
     ) -> std::result::Result<GuestMemoryMmap, Error> {
         create_guest_memory(
-            &regions.iter().map(|r| (None, r.0, r.1)).collect::<Vec<_>>(),
+            regions
+                .iter()
+                .map(|r| RegionInfo::new(None, r.0, r.1, None))
+                .collect::<Vec<_>>(),
             track_dirty_pages,
         )
     }

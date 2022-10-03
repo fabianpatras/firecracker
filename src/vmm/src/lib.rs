@@ -283,9 +283,6 @@ pub struct Vmm {
     vm: Vm,
     guest_memory: GuestMemoryMmap,
 
-    // Memory devices owned memory backends.
-    memory_device_guest_memory: Vec<GuestMemoryMmap>,
-
     // Save UFFD in order to keep it open in the Firecracker process, as well.
     // Since this field is never read again, we need to allow `dead_code`.
     #[allow(dead_code)]

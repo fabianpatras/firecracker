@@ -4,18 +4,16 @@
 use std::cmp;
 use std::io::Write;
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use logger::{error, info};
 use utils::eventfd::EventFd;
 use utils::get_page_size;
 use virtio_gen::virtio_blk::VIRTIO_F_VERSION_1;
-use vm_memory::{ByteValued, GuestMemoryMmap};
+use vm_memory::{ByteValued, GuestMemoryMmap, MemoryBlockTracker};
 
-use super::super::{ActivateResult, DeviceState, Queue, VirtioDevice, TYPE_MEMORY};
-use super::{MemoryResult, QUEUE_SIZE};
-use crate::virtio::memory::Error as MemoryError;
-use crate::virtio::IrqTrigger;
+use crate::virtio::memory::{Error as MemoryError, MemoryResult, QUEUE_SIZE};
+use crate::virtio::{ActivateResult, DeviceState, IrqTrigger, Queue, VirtioDevice, TYPE_MEMORY};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -50,6 +48,7 @@ pub struct Memory {
     // Implementation specific fields.
     pub(crate) id: String,
     addr_is_set: bool,
+    block_tracker: Option<Arc<Mutex<MemoryBlockTracker>>>,
 }
 
 impl Memory {
@@ -59,7 +58,7 @@ impl Memory {
         region_size: u64,
         id: String,
     ) -> MemoryResult<Memory> {
-        // the way thsi device will handle hot(un)plugs requires the block size
+        // the way this device will handle hot(un)plugs requires the block size
         // to be a multiple of the host page size
         //
         // memory device is only available for 64 bit platforms
@@ -116,7 +115,17 @@ impl Memory {
             activate_evt: EventFd::new(libc::EFD_NONBLOCK).map_err(MemoryError::EventFd)?,
             queues: [Queue::new(QUEUE_SIZE)],
             queue_evts,
+            block_tracker: None,
         })
+    }
+
+    pub fn attach_block_tracker(
+        &mut self,
+        block_tracker: Arc<Mutex<MemoryBlockTracker>>,
+    ) -> MemoryResult<()> {
+        self.block_tracker = Some(block_tracker);
+
+        Ok(())
     }
 
     /// Process device virtio queue.
@@ -136,8 +145,18 @@ impl Memory {
             return Err(MemoryError::AddressAlreadySet);
         }
         self.config_space.addr = addr;
+        self.addr_is_set = true;
 
         Ok(())
+    }
+
+    /// Retrieves the base address of the memory device if set.
+    pub fn get_addr(&self) -> Option<u64> {
+        if self.addr_is_set {
+            Some(self.config_space.addr)
+        } else {
+            None
+        }
     }
 
     /// Resturns the identifier of the device.

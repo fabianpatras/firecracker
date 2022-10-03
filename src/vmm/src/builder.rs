@@ -3,7 +3,8 @@
 
 //! Enables pre-boot setup, instantiation and booting of a Firecracker VMM.
 
-use std::convert::TryFrom;
+use std::cmp;
+use std::convert::{TryFrom, TryInto};
 use std::fmt::{Display, Formatter};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -27,14 +28,16 @@ use linux_loader::loader::elf::Elf as Loader;
 #[cfg(target_arch = "aarch64")]
 use linux_loader::loader::pe::PE as Loader;
 use linux_loader::loader::KernelLoader;
-use logger::{error, warn, METRICS};
+use logger::{debug, error, warn, METRICS};
 use seccompiler::BpfThreadMap;
 use snapshot::Persist;
 use userfaultfd::Uffd;
 use utils::eventfd::EventFd;
 use utils::terminal::Terminal;
 use utils::time::TimestampUs;
-use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+use vm_memory::{
+    Address, Bytes, GuestAddress, GuestMemoryMmap, RegionInfo, VIRTO_MEM_LOWER_ADDRESS_BOUND,
+};
 #[cfg(target_arch = "aarch64")]
 use vm_superio::Rtc;
 use vm_superio::Serial;
@@ -52,17 +55,12 @@ use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::machine_config::{VmConfigError, VmUpdateConfig};
 use crate::vstate::system::KvmContext;
 use crate::vstate::vcpu::{Vcpu, VcpuConfig};
-use crate::vstate::vm;
 use crate::vstate::vm::Vm;
 use crate::{device_manager, Error, EventManager, Vmm, VmmEventsObserver};
-
-const GIB: u64 = 1024 * 1024 * 1024;
 
 /// Errors associated with starting the instance.
 #[derive(Debug)]
 pub enum StartMicrovmError {
-    /// Could not register additional guest memory (used by memory device) to VM.
-    AddMemoryDeviceRegion(vm::Error),
     /// Unable to attach block device to Vmm.
     AttachBlockDevice(io::Error),
     /// This error is thrown by the minimal boot loader implementation.
@@ -117,9 +115,6 @@ impl Display for StartMicrovmError {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         use self::StartMicrovmError::*;
         match self {
-            AddMemoryDeviceRegion(err) => {
-                write!(f, "Could not register additional guest memory: {}", err)
-            }
             AttachBlockDevice(err) => write!(f, "Unable to attach block device to Vmm: {}", err),
             ConfigureSystem(err) => write!(f, "System configuration error: {:?}", err),
             CreateRateLimiter(err) => write!(f, "Cannot create RateLimiter: {}", err),
@@ -308,7 +303,6 @@ fn create_vmm_and_vcpus(
         shutdown_exit_code: None,
         vm,
         guest_memory,
-        memory_device_guest_memory: Vec::new(),
         uffd,
         vcpus_handles: Vec::new(),
         vcpus_exit_evt,
@@ -343,8 +337,11 @@ pub fn build_microvm_for_boot(
         .ok_or(MissingKernelConfig)?;
 
     let track_dirty_pages = vm_resources.track_dirty_pages();
-    let guest_memory =
-        create_guest_memory(vm_resources.vm_config().mem_size_mib, track_dirty_pages)?;
+    let guest_memory = create_guest_memory(
+        vm_resources.vm_config().mem_size_mib,
+        vm_resources.memory.iter(),
+        track_dirty_pages,
+    )?;
     let vcpu_config = vm_resources.vcpu_config();
     let entry_addr = load_kernel(boot_config, &guest_memory)?;
     let initrd = load_initrd_from_config(boot_config, &guest_memory)?;
@@ -635,18 +632,62 @@ pub fn build_microvm_from_snapshot(
 }
 
 /// Creates GuestMemory of `mem_size_mib` MiB in size.
-pub fn create_guest_memory(
+pub fn create_guest_memory<'a>(
     mem_size_mib: usize,
+    memory_devices: impl Iterator<Item = &'a Arc<Mutex<Memory>>>,
     track_dirty_pages: bool,
 ) -> std::result::Result<GuestMemoryMmap, StartMicrovmError> {
     let mem_size = mem_size_mib << 20;
+
+    // this line creates 1 (potentially 2) pairs (start_address, size) depending on the arch
     let arch_mem_regions = arch::arch_memory_regions(mem_size);
 
+    // adding a new member to the tuple saying it is not a memory device
+    let mut mem_regions = arch_mem_regions
+        .iter()
+        .map(|(addr, size)| (*addr, *size, None))
+        .collect::<Vec<_>>();
+
+    let lower_bound = GuestAddress::new(VIRTO_MEM_LOWER_ADDRESS_BOUND);
+
+    let mut last_address: GuestAddress;
+    {
+        let (guest_address, size, _) = mem_regions.last().expect("empty mem_regions");
+        let temp_guest_address = cmp::max(
+            guest_address
+                .checked_add((*size).try_into().unwrap())
+                .expect("Address overflow"),
+            lower_bound,
+        );
+
+        last_address = temp_guest_address.clone();
+    }
+
+    // here ne need to do some magic so that for each memory device
+    for memory_device in memory_devices {
+        let mut locked_memory_device = memory_device.lock().expect("Poisoned lock");
+        let size = locked_memory_device.region_size();
+
+        mem_regions.push((
+            last_address.clone(),
+            size.try_into().unwrap(),
+            Some(locked_memory_device.block_size() as usize),
+        ));
+        locked_memory_device
+            .set_addr(last_address.raw_value())
+            .unwrap();
+
+        // pushing back the last_address
+        last_address = last_address.checked_add(size).expect("Address overflow");
+    }
+
     vm_memory::create_guest_memory(
-        &arch_mem_regions
+        mem_regions
             .iter()
-            .map(|(addr, size)| (None, *addr, *size))
-            .collect::<Vec<_>>()[..],
+            .map(|(addr, size, device_info)| {
+                RegionInfo::new(None, *addr, *size, device_info.clone())
+            })
+            .collect::<Vec<_>>(),
         track_dirty_pages,
     )
     .map_err(StartMicrovmError::GuestMemoryMmap)
@@ -1041,35 +1082,28 @@ fn attach_memory_devices<'a>(
             panic!("too many memory devices. please only use one for now!! Thx >.< !!")
         }
 
-        let id = String::from(memory.lock().expect("Poisoned lock").id());
-        let size: usize = memory.lock().expect("Poisoned lock").region_size() as usize;
+        let id;
+
+        {
+            let mut locked_memory_device = memory.lock().expect("Poisoned lock");
+            let base_addr = locked_memory_device
+                .get_addr()
+                .expect("Memory device base address not set");
+
+            id = String::from(locked_memory_device.id());
+
+            // This is where the memory device gets its block tracker attached.
+            locked_memory_device
+                .attach_block_tracker(
+                    vmm.guest_memory()
+                        .get_block_tracker(base_addr)
+                        .map_err(StartMicrovmError::GuestMemoryMmap)?,
+                )
+                .map_err(StartMicrovmError::MemoryDevice)?;
+        }
 
         // The device mutex mustn't be locked here otherwise it will deadlock.
         attach_virtio_device(event_manager, vmm, id, memory.clone(), cmdline)?;
-
-        // For now, when developing/testing with only one memory device, this hardcoded address
-        // should suffice.
-        let region_start_address = 32 * GIB;
-
-        // Creating the actual memory backend for this memory device.
-        let this_device_memory = vm_memory::create_guest_memory(
-            &[(None, GuestAddress(region_start_address), size)],
-            false,
-        )
-        .map_err(StartMicrovmError::GuestMemoryMmap)?;
-
-        // Adding the memory to the VM.
-        vmm.vm
-            .add_memory(&this_device_memory)
-            .map_err(StartMicrovmError::AddMemoryDeviceRegion)?;
-
-        vmm.memory_device_guest_memory = vec![this_device_memory];
-
-        memory
-            .lock()
-            .expect("Poisoned lock")
-            .set_addr(region_start_address)
-            .map_err(StartMicrovmError::MemoryDevice)?;
     }
 
     Ok(())

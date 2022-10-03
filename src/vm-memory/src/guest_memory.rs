@@ -23,6 +23,28 @@ enum RegionState {
     Volatile(Arc<Mutex<MemoryBlockTracker>>),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    /// Provided address is the base address of a fixed region.
+    #[error("Provided address is the base address of a fixed region.")]
+    AddressBaseOfFixedRegion,
+    /// Provided address is not the base address of any region.
+    #[error("Provided address is not the start addresss of any region.")]
+    AddressNotBaseOfRegion,
+    /// Memory region with this base address already exists.
+    #[error("Duplicate base address: {0}")]
+    DuplicateBaseAddress(u64),
+    /// Error related to the creation of a memory map.
+    #[error("{0}")]
+    GuestMemoryMmap(#[from] GuestMemoryMmapError),
+    /// Regions order is broken.
+    #[error("Normal region detected after memory device region")]
+    NormalRegionAfterDeviceRegion,
+    /// Block tracker not found.
+    #[error("No block tracker associated with device \"{0}\"")]
+    TrackerNotFound(String),
+}
+
 /// Structure that tracks the validity of memory blocks inside a memory region.
 /// The memory region is a contiguous physical address range inside the
 /// guests' memory so it cannot have holes.
@@ -46,9 +68,35 @@ pub struct MemoryBlockTracker {
     // Structure to track if the blocks are valid
     // Should only be modified by the owning memory device.
     bitmap: AtomicBitmap,
+
+    // Cache for the last valid address. It is always up-to-date. It's easier to update
+    // it when hot(un)plugging than to traverse the bitmap.
+    // `None` signifies no actual last address -> no memory provided.
+    last_addr: Option<GuestAddress>,
+}
+
+impl MemoryBlockTracker {
+    pub fn new(memory_region: Arc<GuestRegionMmap>, block_size: usize) -> Self {
+        let region_size = memory_region.size();
+        let bitmap = AtomicBitmap::new(region_size, block_size);
+        MemoryBlockTracker {
+            memory_region,
+            bitmap,
+            last_addr: None,
+        }
+    }
+}
+
+impl MemoryBlockTracker {
+    /// Retrieves the last (inclusive) valid address tracked.
+    fn last_addr(&self) -> Option<GuestAddress> {
+        self.last_addr
+    }
 }
 
 /// A wrapper over upstream GuestMemoryMmap.
+///
+/// All `Device`-backed regions come after all `Normal` regions.
 #[derive(Debug, Clone)]
 pub struct GuestMemoryMmap {
     // Original `guest_memory`; Once constructed this should never be modified.
@@ -59,7 +107,7 @@ pub struct GuestMemoryMmap {
     state: Arc<Mutex<HashMap<u64, RegionState>>>,
 }
 
-/// implementing the `GuestMemory` for our wrapper structure over the upstream
+/// Implementing the `GuestMemory` for our wrapper structure over the upstream
 /// `GuestMemoryMmap` by using the implemented upstream methods (for now).
 ///
 /// Methods `num_regions`, `find_region` and `iter` do not have a default
@@ -79,6 +127,11 @@ pub struct GuestMemoryMmap {
 ///   of the methods that use this one as needed. It will passthrough.
 ///
 /// - `iter`: this is only used to compute `last_addr`. It will passthrough.
+///
+/// Other overridden methods:
+/// - `last_addr`: it now returns the last (inclusive) address that is exposed as normal RAM.
+/// The reason for this is that this method is used when setting up the system and telling the
+/// guest OS how much (non virtio-mem) memory it has.
 impl GuestMemory for GuestMemoryMmap {
     type R = GuestRegionMmap;
     type I = GuestMemoryMmapUpstream<Option<AtomicBitmap>>;
@@ -106,13 +159,47 @@ impl GuestMemory for GuestMemoryMmap {
         // but we still need to check if the address is valid based on who provides that region.
         true
     }
+
+    /// Return the last (inclusive) address.
+    fn last_addr(&self) -> GuestAddress {
+        // Iterator implementation does not support `rev()`.
+        self.iter()
+            .map(|region| {
+                let base_addr = region.start_addr().raw_value();
+                let locked_state = self.state.lock().expect("Poisoned lock");
+
+                let region_state = locked_state
+                    .get(&base_addr)
+                    .expect("GuestMemory broker internal state");
+
+                match region_state {
+                    RegionState::Fixed => Some(region.last_addr()),
+                    RegionState::Volatile(tracker) => {
+                        tracker.lock().expect("Poisoned lock").last_addr()
+                    }
+                }
+            })
+            .fold(GuestAddress::new(0), |acc, next| match next {
+                Some(addr) => std::cmp::max(acc, addr),
+                None => acc,
+            })
+    }
+}
+
+/// Wrapper structure to avoid passing tuples.
+pub(crate) struct Region(Arc<GuestRegionMmap>, Option<usize>);
+
+impl Region {
+    pub fn new(region: Arc<GuestRegionMmap>, info: Option<usize>) -> Self {
+        Region(region, info)
+    }
 }
 
 /// Implementing methods for creating `GuestMemoryMmap`.
 impl GuestMemoryMmap {
     /// This creates a `GuestMemoryMmap` without knowing which of the regions are provided
     /// by memory devices.
-    pub fn from_regions(regions: Vec<GuestRegionMmap>) -> Result<Self, GuestMemoryMmapError> {
+    pub fn from_regions(regions: Vec<GuestRegionMmap>) -> Result<Self, Error> {
         let mmap = GuestMemoryMmapUpstream::from_regions(regions)?;
         let mut state = HashMap::new();
 
@@ -127,5 +214,65 @@ impl GuestMemoryMmap {
             mmap,
             state: Arc::new(Mutex::new(state)),
         })
+    }
+
+    /// This creates a `GuestMemoryMmap` by knowing from the start who provides/manages
+    /// the memory regions.
+    ///
+    /// Caller must make sure all the `Normal` regions are placed before any `Device` region
+    /// and that all the regions are ordered and do not overlap.
+    pub(crate) fn new(regions: Vec<Region>) -> Result<Self, Error> {
+        // Checking to see if there's a `Normal` region after a `Device` one as
+        // that should not happen.
+        let mut device_present = false;
+        let mut state = HashMap::new();
+
+        // The vec of memory regions that we'll pass to upstream `from_arc_regions`.
+        let mut mmap_regions = Vec::with_capacity(regions.len());
+
+        for region in regions {
+            let (region, device_info) = (region.0, region.1);
+            let base_addr = region.start_addr().raw_value();
+            let region_state;
+
+            if let Some(block_size) = device_info {
+                // Got a device. If we see a `Normal` region from now on we throw an error.
+                device_present = true;
+
+                let block_tracker = Arc::new(Mutex::new(MemoryBlockTracker::new(
+                    region.clone(),
+                    block_size,
+                )));
+
+                region_state = RegionState::Volatile(block_tracker);
+            } else {
+                region_state = RegionState::Fixed;
+
+                if device_present {
+                    return Err(Error::NormalRegionAfterDeviceRegion);
+                }
+            }
+            // If `trackers` already had an entry for this device the caller is at fault.
+            if state.insert(base_addr, region_state).is_some() {
+                return Err(Error::DuplicateBaseAddress(base_addr));
+            };
+            mmap_regions.push(region);
+        }
+
+        Ok(Self {
+            mmap: GuestMemoryMmapUpstream::from_arc_regions(mmap_regions)?,
+            state: Arc::new(Mutex::new(state)),
+        })
+    }
+
+    pub fn get_block_tracker(
+        &self,
+        base_addr: u64,
+    ) -> Result<Arc<Mutex<MemoryBlockTracker>>, Error> {
+        match self.state.lock().expect("Poisoned lock").get(&base_addr) {
+            Some(RegionState::Fixed) => Err(Error::AddressBaseOfFixedRegion),
+            Some(RegionState::Volatile(tracker)) => Ok(tracker.clone()),
+            None => Err(Error::AddressNotBaseOfRegion),
+        }
     }
 }
