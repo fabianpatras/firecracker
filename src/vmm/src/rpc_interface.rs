@@ -34,6 +34,7 @@ use crate::vmm_config::drive::{BlockDeviceConfig, BlockDeviceUpdateConfig, Drive
 use crate::vmm_config::instance_info::InstanceInfo;
 use crate::vmm_config::logger::{LoggerConfig, LoggerConfigError};
 use crate::vmm_config::machine_config::{VmConfig, VmConfigError, VmUpdateConfig};
+use crate::vmm_config::memory::{MemoryConfigError, MemoryUpdateConfig};
 use crate::vmm_config::metrics::{MetricsConfig, MetricsConfigError};
 use crate::vmm_config::mmds::{MmdsConfig, MmdsConfigError};
 use crate::vmm_config::net::{
@@ -117,6 +118,8 @@ pub enum VmmAction {
     UpdateBalloonStatistics(BalloonUpdateStatsConfig),
     /// Update existing block device properties such as `path_on_host` or `rate_limiter`.
     UpdateBlockDevice(BlockDeviceUpdateConfig),
+    /// Update `requested_memory` of memory device with the given device id.
+    UpdateMemoryDevice(String, MemoryUpdateConfig),
     /// Update a network interface, after microVM start. Currently, the only updatable properties
     /// are the RX and TX rate limiters.
     UpdateNetworkInterface(NetworkInterfaceUpdateConfig),
@@ -146,6 +149,8 @@ pub enum VmmActionError {
     /// One of the actions `GetVmConfiguration` or `UpdateVmConfiguration` failed because of bad
     /// input.
     MachineConfig(VmConfigError),
+    /// The action `UpdateMemoryDevice` failed because <TODO>.
+    MemoryConfig(MemoryConfigError),
     /// The action `ConfigureMetrics` failed because of bad user input.
     Metrics(MetricsConfigError),
     /// One of the `GetMmds`, `PutMmds` or `PatchMmds` actions failed.
@@ -186,6 +191,7 @@ impl Display for VmmActionError {
                 LoadSnapshot(err) => format!("Load microVM snapshot error: {}", err),
                 Logger(err) => err.to_string(),
                 MachineConfig(err) => err.to_string(),
+                MemoryConfig(err) => err.to_string(),
                 Metrics(err) => err.to_string(),
                 Mmds(err) => err.to_string(),
                 MmdsConfig(err) => err.to_string(),
@@ -442,6 +448,7 @@ impl<'a> PrebootApiController<'a> {
             | UpdateBalloon(_)
             | UpdateBalloonStatistics(_)
             | UpdateBlockDevice(_)
+            | UpdateMemoryDevice(_, _)
             | UpdateNetworkInterface(_) => Err(VmmActionError::OperationNotSupportedPreBoot),
             #[cfg(target_arch = "x86_64")]
             SendCtrlAltDel => Err(VmmActionError::OperationNotSupportedPreBoot),
@@ -657,6 +664,14 @@ impl RuntimeApiController {
                 .map(|_| VmmData::Empty)
                 .map_err(|err| VmmActionError::BalloonConfig(BalloonConfigError::from(err))),
             UpdateBlockDevice(new_cfg) => self.update_block_device(new_cfg),
+            UpdateMemoryDevice(device_id, config_update) => self
+                .vmm
+                .lock()
+                .expect("Poisoned lock")
+                .update_memory_device(device_id, config_update.requested_size_kib)
+                .map(|_| VmmData::Empty)
+                .map_err(|err| VmmActionError::MemoryConfig(MemoryConfigError::from(err))),
+
             UpdateNetworkInterface(netif_update) => self.update_net_rate_limiters(netif_update),
 
             // Operations not allowed post-boot.

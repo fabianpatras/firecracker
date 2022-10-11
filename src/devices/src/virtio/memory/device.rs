@@ -35,6 +35,8 @@ pub(crate) struct ConfigSpace {
     pub requested_size: u64,
 }
 
+pub struct MemoryUpdate {}
+
 // Safe because ConfigSpace only contains plain data.
 unsafe impl ByteValued for ConfigSpace {}
 
@@ -205,6 +207,8 @@ impl Memory {
                             .expect("Poisoned lock")
                             .plug_blocks(request.addr, request.nb_blocks as u64);
 
+                        // let result: = mem.plug_blocks(request.addr, nr_blocks);
+
                         let resp;
 
                         match result {
@@ -315,14 +319,30 @@ impl Memory {
             .map_err(MemoryError::InterruptError)
     }
 
+    fn update_config_update(&self) -> Result<(), MemoryError> {
+        self.irq_trigger
+            .trigger_irq(IrqType::Config)
+            .map_err(MemoryError::InterruptError)
+    }
+
     /// Handle
-    pub fn change_requested_size(&mut self, requested_size: u64) -> Result<(), MemoryError> {
+    pub fn change_requested_size(&mut self, requested_size_kib: u64) -> Result<(), MemoryError> {
+        let requested_size = requested_size_kib * 1024;
+
         // TODO
         info!(
             "Got a request to change the requested_size of memory device [{}] to [{}] bytes",
             self.id(),
             requested_size
         );
+
+        // TODO: implement better sanitization, but..
+        assert!(requested_size > 0);
+        assert!(requested_size <= self.config_space.region_size);
+
+        self.config_space.requested_size = requested_size;
+
+        self.update_config_update()?;
 
         Ok(())
     }

@@ -42,13 +42,14 @@ use std::{fmt, io};
 use arch::DeviceType;
 use devices::legacy::serial::{IER_RDA_BIT, IER_RDA_OFFSET};
 use devices::virtio::balloon::Error as BalloonError;
+use devices::virtio::memory::Error as MemoryError;
 use devices::virtio::{
-    Balloon, BalloonConfig, BalloonStats, Block, MmioTransport, Net, BALLOON_DEV_ID, TYPE_BALLOON,
-    TYPE_BLOCK, TYPE_NET,
+    Balloon, BalloonConfig, BalloonStats, Block, Memory, MmioTransport, Net, BALLOON_DEV_ID,
+    TYPE_BALLOON, TYPE_BLOCK, TYPE_MEMORY, TYPE_NET,
 };
 use devices::BusDevice;
 use event_manager::{EventManager as BaseEventManager, EventOps, Events, MutEventSubscriber};
-use logger::{error, info, warn, LoggerError, MetricsError, METRICS};
+use logger::{debug, error, info, warn, LoggerError, MetricsError, METRICS};
 use rate_limiter::BucketUpdate;
 use seccompiler::BpfProgram;
 use snapshot::Persist;
@@ -749,6 +750,36 @@ impl Vmm {
             Ok(())
         } else {
             Err(BalloonError::DeviceNotFound)
+        }
+    }
+
+    /// Updates the `requested_size` configuration field for the memory device.
+    pub fn update_memory_device(
+        &self,
+        device_id: String,
+        reqested_size_kib: u64,
+    ) -> std::result::Result<(), MemoryError> {
+        debug!("[update_memory_device][called] Device id: [{}]", device_id);
+        if let Some(bus_device) = self.get_bus_device(DeviceType::Virtio(TYPE_MEMORY), &device_id) {
+            let virtio_device = bus_device
+                .lock()
+                .expect("Poisoned lock")
+                .as_mut_any()
+                .downcast_mut::<MmioTransport>()
+                .unwrap()
+                .device();
+
+            virtio_device
+                .lock()
+                .expect("Poisoned lock")
+                .as_mut_any()
+                .downcast_mut::<Memory>()
+                .unwrap()
+                .change_requested_size(reqested_size_kib)?;
+
+            Ok(())
+        } else {
+            Err(MemoryError::DeviceNotFound)
         }
     }
 

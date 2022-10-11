@@ -15,7 +15,7 @@ type MutexMemory = Arc<Mutex<Memory>>;
 #[derive(Debug, derive_more::From)]
 pub enum MemoryConfigError {
     /// The user made a request on an inexistent memory device.
-    DeviceNotFound,
+    DeviceNotFound(String),
     /// Device not activated yet.
     DeviceNotActive,
     /// There already exists a device with this id.
@@ -28,7 +28,9 @@ impl fmt::Display for MemoryConfigError {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         use self::MemoryConfigError::*;
         match self {
-            DeviceNotFound => write!(f, "No memory device found."),
+            DeviceNotFound(device_id) => {
+                write!(f, "There is no memory device with this id: {}", device_id)
+            }
             DeviceNotActive => write!(
                 f,
                 "Device is inactive, check if memory driver is enabled in guest kernel."

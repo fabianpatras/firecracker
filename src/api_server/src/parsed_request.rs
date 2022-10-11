@@ -17,6 +17,7 @@ use crate::request::logger::parse_put_logger;
 use crate::request::machine_configuration::{
     parse_get_machine_config, parse_patch_machine_config, parse_put_machine_config,
 };
+use crate::request::memory::parse_patch_memory;
 use crate::request::metrics::parse_put_metrics;
 use crate::request::mmds::{parse_get_mmds, parse_patch_mmds, parse_put_mmds};
 use crate::request::net::{parse_patch_net, parse_put_net};
@@ -127,6 +128,9 @@ impl ParsedRequest {
             }
             (Method::Patch, "vm", Some(body)) => parse_patch_vm_state(body),
             (Method::Patch, _, None) => method_to_error(Method::Patch),
+            (Method::Patch, "virtio-mem", Some(body)) => {
+                parse_patch_memory(body, path_tokens.get(1))
+            }
             (method, unknown_uri, _) => {
                 Err(Error::InvalidPathMethod(unknown_uri.to_string(), method))
             }

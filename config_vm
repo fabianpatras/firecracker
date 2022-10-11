@@ -25,10 +25,10 @@
 	"balloon": null,
 	"memory-devices": [
 		{
-			"id": "memory-dev-1",
+			"id": "memory_dev_1",
 			"region_size_kib": 8388608,
 			"block_size_kib": 1024,
-			"requested_size_kib": 4194304
+			"requested_size_kib": 0
 		}
 	],
 	"network-interfaces": [],
